@@ -199,7 +199,7 @@ def cmd_add(message):
         bot.send_message(message.from_user.id, "⛔ Нет доступа.")
         return
 
-    parts = message.text.split(maxsplit=3)
+    parts = message.text.split()
     if len(parts) < 4:
         if user["role"] == "superadmin":
             roles_hint = "`worker` | `manager` | `admin`"
@@ -214,7 +214,9 @@ def cmd_add(message):
         )
         return
 
-    _, tid_str, name, role = parts
+    tid_str = parts[1]
+    role    = parts[-1]
+    name    = " ".join(parts[2:-1])
 
     # Проверяем права на добавление данной роли
     allowed = SUPER_MANAGED if user["role"] == "superadmin" else ADMIN_MANAGED
