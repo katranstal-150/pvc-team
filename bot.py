@@ -243,7 +243,8 @@ init_db()
 def get_user(tid):
     conn = get_db()
     u = conn.execute("SELECT * FROM users WHERE telegram_id=?", (tid,)).fetchone()
-    conn.close(); return u
+    conn.close()
+    return u
 
 def notify_supervisors(text, **kwargs):
     if not is_work_time(): return
@@ -685,6 +686,12 @@ def handle_callback(call):
         _start_price_change(call.from_user.id,nom_id,ptype); return
     if cd.startswith("nm:ph:"):
         nom_id=int(cd.split(":")[2]); ans(call); edit(call,_price_history(nom_id)); return
+    if cd.startswith("nm:del:"):
+        nom_id=int(cd.split(":")[2]); ans(call)
+        conn=get_db()
+        conn.execute("UPDATE nomenclature SET active=0 WHERE id=?", (nom_id,))
+        conn.commit(); conn.close()
+        edit(call,"✅ Позиция удалена.", ik([("🔙 К номенклатуре","nm:list")])); return
 
     # Контрагенты
     if cd == "cp:list": ans(call); edit(call,_cp_list_text(),_cp_registry_kb()); return
@@ -758,15 +765,6 @@ def handle_callback(call):
         oid=int(cd.split(":")[2]); ans(call)
         user_states[call.from_user.id]=f"ord:addcomment:{oid}"
         bot.send_message(call.from_user.id,"💬 Введите комментарий к заказу:\n_/cancel для отмены_",parse_mode="Markdown"); return
-    if cd.startswith("ord:waybill:"):
-        sid=int(cd.split(":")[2]); ans(call)
-        _generate_waybill_choice(call.from_user.id, sid); return
-    if cd.startswith("ord:wb:xlsx:"):
-        sid=int(cd.split(":")[2]); ans(call)
-        _generate_waybill(call.from_user.id, sid, "xlsx"); return
-    if cd.startswith("ord:wb:pdf:"):
-        sid=int(cd.split(":")[2]); ans(call)
-        _generate_waybill(call.from_user.id, sid, "pdf"); return
     if cd.startswith("cp:sel:"):
         cp_id=int(cd.split(":")[2]); ans(call); _order_cp_selected(call.from_user.id,cp_id); return
     if cd.startswith("ni:"):
@@ -838,11 +836,6 @@ def handle_callback(call):
     # Финансы — Реестр и отчёт
     if cd == "exp:list":    ans(call); edit(call,_expenses_registry(),_expenses_registry_kb()); return
     if cd == "fin:report":  ans(call); edit(call,_financial_report()); return
-
-    # Цена продажи при отгрузке
-    if cd.startswith("sp:"):
-        parts=cd.split(":"); nom_id=int(parts[1]); ans(call)
-        _start_sale_price_input(call.from_user.id,nom_id); return
 
     ans(call)
 
@@ -1175,12 +1168,10 @@ def _financial_report():
 
     total_revenue = 0.0
     total_cost    = 0.0
-    ship_lines    = []
 
     for s in ships:
         sitems = conn.execute(
             "SELECT si.quantity, si.sale_price, "
-            "COALESCE(n.name,n2.name) as nom_name, "
             "COALESCE(n.cost_price,n2.cost_price,0) as cost_price "
             "FROM shipment_items si "
             "LEFT JOIN order_items oi ON oi.id=si.order_item_id "
@@ -1300,9 +1291,9 @@ def _salary_year_report():
         lines.append(f"👷 *{w['name']}*")
         year_total = 0.0
         for m in range(1, now.month + 1):
+            import calendar
             month_start = datetime(year, m, 1)
             if m < now.month:
-                import calendar
                 last_day = calendar.monthrange(year, m)[1]
                 month_end = datetime(year, m, last_day, 23, 59, 59)
             else:
@@ -1343,80 +1334,137 @@ def _sal_user_selected(tid, uid):
 
 def _orders_list_view(role):
     conn = get_db()
-    if role == "manager":
-        orders = conn.execute(
-            "SELECT o.*,c.name as cp_name FROM orders o LEFT JOIN counterparties c ON c.id=o.counterparty_id "
-            "WHERE o.status!='shipped' ORDER BY o.created_at DESC"
-        ).fetchall()
-    else:
-        orders = conn.execute(
-            "SELECT o.*,c.name as cp_name FROM orders o LEFT JOIN counterparties c ON c.id=o.counterparty_id "
-            "ORDER BY o.created_at DESC LIMIT 30"
-        ).fetchall()
-    conn.close()
-    if not orders: return "📦 Заказов нет.", ik([("🔙 Назад","mn:sales")])
-    lines = ["📦 *Реестр заказов:*\n"]; kb_rows = []
-    for o in orders:
-        st  = ORDER_STATUS_LABELS.get(o["status"], o["status"])
-        cp  = o["cp_name"] or "—"
-        due = f" | до {o['desired_date']}" if o["desired_date"] else ""
-        lines.append(f"• {o['number']} | {cp} | {st}{due}")
-        kb_rows.append([(f"{o['number']} | {cp} | {st}", f"ord:v:{o['id']}")])
-    kb_rows.append([("🔙 Назад","mn:sales")])
-    return "\n".join(lines), ik(*kb_rows)
+    try:
+        if role == "manager":
+            orders = conn.execute(
+                "SELECT o.*, c.name as cp_name FROM orders o "
+                "LEFT JOIN counterparties c ON c.id = o.counterparty_id "
+                "WHERE o.status != 'shipped' ORDER BY o.created_at DESC"
+            ).fetchall()
+        else:
+            orders = conn.execute(
+                "SELECT o.*, c.name as cp_name FROM orders o "
+                "LEFT JOIN counterparties c ON c.id = o.counterparty_id "
+                "ORDER BY o.created_at DESC LIMIT 30"
+            ).fetchall()
+        
+        if not orders: 
+            return "📦 Заказов нет.", ik([("🔙 Назад", "mn:sales")])
+        
+        lines = ["📦 *Реестр заказов:*\n"]
+        kb_rows = []
+        
+        for o in orders:
+            st = ORDER_STATUS_LABELS.get(o["status"], o["status"])
+            cp = o["cp_name"] or "—"
+            due = f" | до {o['desired_date']}" if o["desired_date"] else ""
+            lines.append(f"• {o['number']} | {cp} | {st}{due}")
+            kb_rows.append([(f"{o['number']} | {cp} | {st}", f"ord:v:{o['id']}")])
+        
+        kb_rows.append([("🔙 Назад", "mn:sales")])
+        return "\n".join(lines), ik(*kb_rows)
+    finally:
+        conn.close()
 
 def _order_detail_view(oid, role):
     conn = get_db()
-    o  = conn.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
-    if not o: conn.close(); return "Заказ не найден.", None
-    cp = conn.execute("SELECT * FROM counterparties WHERE id=?", (o["counterparty_id"],)).fetchone()
-    cr = conn.execute("SELECT name FROM users WHERE id=?", (o["created_by"],)).fetchone()
-    items = conn.execute(
-        "SELECT oi.*,n.name,n.unit,n.code FROM order_items oi JOIN nomenclature n ON n.id=oi.nomenclature_id WHERE oi.order_id=?",
-        (oid,)
-    ).fetchall(); conn.close()
-    status = ORDER_STATUS_LABELS.get(o["status"],o["status"])
-    lines = [
-        f"📦 *Заказ {o['number']}*",
-        f"👥 {esc(cp['name']) if cp else '—'} ({c(cp['code']) if cp else '—'})",
-        f"📅 Создан: {fmt_dt(o['created_at'])}",
-        f"⏰ Готовность: {o['desired_date'] or '—'}",
-        f"👤 {cr['name'] if cr else '—'}",
-        f"📊 {status}\n", "*Позиции:*"
-    ]
-    for it in items:
-        rem = it["quantity"]-it["shipped_qty"]; stock = get_stock(it["nomenclature_id"])
-        to_make = max(0,rem-stock); icon = "✅" if stock>=rem else "⚠️"
-        lines.append(f"• *{c(it['code'])}* {it['name']}\n"
-                     f"  Заказано: {it['quantity']:,.1f} | Отгружено: {it['shipped_qty']:,.1f} {it['unit']}\n"
-                     f"  {icon} Склад: {stock:,.1f} | 🔧 Произвести: {to_make:,.1f}")
-    kb_rows = []
-    if role == "manager":
-        BTN = {"new":("✅ Принять",f"ord:s:{oid}:accepted"),"accepted":("🔧 В работу",f"ord:s:{oid}:in_progress"),"in_progress":("🏁 Готово",f"ord:s:{oid}:ready")}
-        if o["status"] in BTN: kb_rows.append([BTN[o["status"]]])
-    if role in ("admin","superadmin"):
-        if o["status"] in ("ready","in_progress","accepted"):
-            kb_rows.append([("📦 Оформить отгрузку",f"ord:ship:{oid}")])
-        kb_rows.append([("✏️ Дата готовности",f"ord:edit:{oid}:desired_date"),("✏️ Примечание",f"ord:edit:{oid}:notes")])
-        kb_rows.append([("🗑 Удалить заказ",f"ord:del:{oid}")])
-    kb_rows.append([("🔙 К заказам","ord:list")])
-    return "\n".join(lines), ik(*kb_rows)
+    try:
+        o = conn.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+        if not o: 
+            return "Заказ не найден.", None
+        
+        cp = conn.execute("SELECT * FROM counterparties WHERE id=?", (o["counterparty_id"],)).fetchone()
+        cr = conn.execute("SELECT name FROM users WHERE id=?", (o["created_by"],)).fetchone()
+        items = conn.execute(
+            "SELECT oi.*, n.name, n.unit, n.code FROM order_items oi "
+            "JOIN nomenclature n ON n.id = oi.nomenclature_id WHERE oi.order_id = ?",
+            (oid,)
+        ).fetchall()
+        
+        # Получаем комментарии
+        comments = conn.execute(
+            "SELECT oc.*, u.name as user_name FROM order_comments oc "
+            "JOIN users u ON u.id = oc.user_id "
+            "WHERE oc.order_id = ? ORDER BY oc.created_at DESC LIMIT 10",
+            (oid,)
+        ).fetchall()
+        
+        status = ORDER_STATUS_LABELS.get(o["status"], o["status"])
+        lines = [
+            f"📦 *Заказ {o['number']}*",
+            f"👥 {esc(cp['name']) if cp else '—'} ({c(cp['code']) if cp else '—'})",
+            f"📅 Создан: {fmt_dt(o['created_at'])}",
+            f"⏰ Готовность: {o['desired_date'] or '—'}",
+            f"👤 {cr['name'] if cr else '—'}",
+            f"📊 {status}",
+        ]
+        
+        if o.get("notes"):
+            lines.append(f"📝 {o['notes']}")
+        
+        lines.append("\n*Позиции:*")
+        
+        for it in items:
+            rem = it["quantity"] - it["shipped_qty"]
+            stock = get_stock(it["nomenclature_id"])
+            to_make = max(0, rem - stock)
+            icon = "✅" if stock >= rem else "⚠️"
+            lines.append(
+                f"• *{c(it['code'])}* {it['name']}\n"
+                f"  Заказано: {it['quantity']:,.1f} | Отгружено: {it['shipped_qty']:,.1f} {it['unit']}\n"
+                f"  {icon} Склад: {stock:,.1f} | 🔧 Произвести: {to_make:,.1f}"
+            )
+        
+        if comments:
+            lines.append("\n💬 *Последние комментарии:*")
+            for com in comments:
+                lines.append(f"  • *{com['user_name']}*: {com['text'][:150]}")
+                lines.append(f"    _{fmt_dt(com['created_at'])}_")
+        
+        kb_rows = []
+        if role == "manager":
+            BTN = {
+                "new": ("✅ Принять", f"ord:s:{oid}:accepted"),
+                "accepted": ("🔧 В работу", f"ord:s:{oid}:in_progress"),
+                "in_progress": ("🏁 Готово", f"ord:s:{oid}:ready")
+            }
+            if o["status"] in BTN: 
+                kb_rows.append([BTN[o["status"]]])
+        
+        if role in ("admin", "superadmin"):
+            if o["status"] in ("ready", "in_progress", "accepted"):
+                kb_rows.append([("📦 Оформить отгрузку", f"ord:ship:{oid}")])
+            kb_rows.append([("✏️ Дата готовности", f"ord:edit:{oid}:desired_date"), 
+                          ("✏️ Примечание", f"ord:edit:{oid}:notes")])
+            kb_rows.append([("🗑 Удалить заказ", f"ord:del:{oid}")])
+        
+        kb_rows.append([("💬 Комментарий", f"ord:comment:{oid}")])
+        kb_rows.append([("🔙 К заказам", "ord:list")])
+        return "\n".join(lines), ik(*kb_rows)
+    finally:
+        conn.close()
 
 def _change_order_status(tid, oid, new_status, user):
     conn = get_db()
-    conn.execute("UPDATE orders SET status=? WHERE id=?", (new_status,oid))
-    order = conn.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
-    creator = conn.execute("SELECT * FROM users WHERE id=?", (order["created_by"],)).fetchone()
-    conn.commit(); conn.close()
-    label = ORDER_STATUS_LABELS.get(new_status, new_status)
-    msg = f"📦 Заказ *{order['number']}* → {label}\n👔 {user['name']}"
-    # Уведомляем создателя заказа
-    if creator:
-        try: bot.send_message(creator["telegram_id"], msg, parse_mode="Markdown")
-        except: pass
-    # Уведомляем админов при принятии и завершении
-    if new_status in ("accepted", "ready"):
-        notify_roles(("admin","superadmin"), msg)
+    try:
+        conn.execute("UPDATE orders SET status=? WHERE id=?", (new_status, oid))
+        order = conn.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+        creator = conn.execute("SELECT * FROM users WHERE id=?", (order["created_by"],)).fetchone()
+        conn.commit()
+        
+        label = ORDER_STATUS_LABELS.get(new_status, new_status)
+        msg = f"📦 Заказ *{order['number']}* → {label}\n👔 {user['name']}"
+        
+        # Уведомляем создателя заказа
+        if creator:
+            try: bot.send_message(creator["telegram_id"], msg, parse_mode="Markdown")
+            except: pass
+        
+        # Уведомляем админов при принятии и завершении
+        if new_status in ("accepted", "ready"):
+            notify_roles(("admin", "superadmin"), msg)
+    finally:
+        conn.close()
 
 def _start_new_order(tid):
     conn = get_db(); cps = conn.execute("SELECT * FROM counterparties WHERE active=1 ORDER BY name").fetchall(); conn.close()
@@ -1456,14 +1504,12 @@ def _show_item_picker(tid, call=None):
     rows.append([("📝 Добавить примечание","ord:note")])
     rows.append([("✅ Сохранить заказ","ord:save")])
     kb = ik(*rows)
-    # Редактируем существующее сообщение если возможно, иначе отправляем новое
     if call:
         try:
             bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
                                   reply_markup=kb, parse_mode="Markdown")
             return
         except: pass
-    # Удаляем предыдущее сообщение пикера если оно сохранено
     prev_msg_id = d.get("picker_msg_id")
     if prev_msg_id:
         try: bot.delete_message(tid, prev_msg_id)
@@ -1476,27 +1522,38 @@ def _order_save(call, user):
     if not d.get("items"): ans(call,"❌ Добавьте позицию.",True); return
     now=datetime.now(); ans(call); number=next_order_number()
     conn=get_db()
-    conn.execute("INSERT INTO orders (number,counterparty_id,created_by,created_at,desired_date,status,order_type,notes) VALUES (?,?,?,?,?,'new','production',?)",
-                 (number,d["cp_id"],user["id"],now,d.get("desired_date"),d.get("notes")))
-    oid=conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-    for it in d["items"]:
-        conn.execute("INSERT INTO order_items (order_id,nomenclature_id,quantity) VALUES (?,?,?)", (oid,it["nom_id"],it["qty"]))
-    conn.commit(); conn.close()
-    cancel_state(call.from_user.id)
-    bot.send_message(call.from_user.id,
-        f"✅ *Заказ {number}* создан!\n👥 {esc(d['cp_name'])}\n📅 {now.strftime('%d.%m.%Y %H:%M')}", parse_mode="Markdown")
-    lines=[f"➕ *Новый заказ на производство {number}*\n👥 {esc(d['cp_name'])}\n⏰ {d.get('desired_date') or '—'}\n📅 {now.strftime('%d.%m.%Y %H:%M')}\n"]
-    for it in d["items"]: lines.append(f"• {c(it['code'])} {esc(it['name'])} — {it['qty']:,.1f} {it['unit']}")
-    notify_roles(("manager","admin","superadmin"), "\n".join(lines))
+    try:
+        conn.execute(
+            "INSERT INTO orders (number,counterparty_id,created_by,created_at,desired_date,status,order_type,notes) "
+            "VALUES (?,?,?,?,?,'new','production',?)",
+            (number,d["cp_id"],user["id"],now,d.get("desired_date"),d.get("notes"))
+        )
+        oid=conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        for it in d["items"]:
+            conn.execute("INSERT INTO order_items (order_id,nomenclature_id,quantity) VALUES (?,?,?)", 
+                        (oid,it["nom_id"],it["qty"]))
+        conn.commit()
+        
+        cancel_state(call.from_user.id)
+        bot.send_message(call.from_user.id,
+            f"✅ *Заказ {number}* создан!\n👥 {esc(d['cp_name'])}\n📅 {now.strftime('%d.%m.%Y %H:%M')}", 
+            parse_mode="Markdown")
+        
+        lines=[f"➕ *Новый заказ на производство {number}*\n👥 {esc(d['cp_name'])}\n⏰ {d.get('desired_date') or '—'}\n📅 {now.strftime('%d.%m.%Y %H:%M')}\n"]
+        for it in d["items"]: 
+            lines.append(f"• {c(it['code'])} {esc(it['name'])} — {it['qty']:,.1f} {it['unit']}")
+        notify_roles(("manager","admin","superadmin"), "\n".join(lines))
+    finally:
+        conn.close()
 
 # ─── Реестр отгрузок ──────────────────────────────────────────────────────────
 
 def _shipments_list_view():
     conn = get_db()
     ships = conn.execute(
-        "SELECT s.*,o.number as onum,c.name as cp_name FROM shipments s "
-        "LEFT JOIN orders o ON o.id=s.order_id "
-        "LEFT JOIN counterparties c ON c.id=s.counterparty_id "
+        "SELECT s.*, o.number as onum, c.name as cp_name FROM shipments s "
+        "LEFT JOIN orders o ON o.id = s.order_id "
+        "LEFT JOIN counterparties c ON c.id = s.counterparty_id "
         "ORDER BY s.created_at DESC LIMIT 30"
     ).fetchall(); conn.close()
     if not ships: return "🚚 Отгрузок нет.", ik([("🔙 Назад","mn:sales")])
@@ -1512,7 +1569,7 @@ def _shipments_list_view():
 def _shipment_view(sid, role):
     conn=get_db()
     s=conn.execute(
-        "SELECT s.*,o.number as onum,c.name as cp_name FROM shipments s "
+        "SELECT s.*, o.number as onum, c.name as cp_name FROM shipments s "
         "LEFT JOIN orders o ON o.id=s.order_id "
         "LEFT JOIN counterparties c ON c.id=s.counterparty_id WHERE s.id=?", (sid,)
     ).fetchone()
@@ -1613,33 +1670,39 @@ def _ds_partial_action(tid, user):
     _create_direct_shipment(tid,d,user,partial=True)
     now=datetime.now(); number=next_order_number()
     conn=get_db()
-    conn.execute("INSERT INTO orders (number,counterparty_id,created_by,created_at,status,order_type) VALUES (?,?,?,?,'new','production')",
-                 (number,d.get("cp_id"),user["id"],now))
-    oid=conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-    for sh in shortages:
-        conn.execute("INSERT INTO order_items (order_id,nomenclature_id,quantity) VALUES (?,?,?)", (oid,sh["nom_id"],sh["short"]))
-    conn.commit(); conn.close()
-    bot.send_message(tid,f"✅ Отгрузка создана.\n➕ Автозаказ *{number}* на недостающее количество.", parse_mode="Markdown")
-    lines=[f"➕ *Автозаказ {number}* (нехватка при отгрузке)\n"]
-    for sh in shortages: lines.append(f"• {sh['code']} {sh['name']}: {sh['short']:,.1f} {sh['unit']}")
-    notify_roles(("manager","admin","superadmin"),"\n".join(lines))
+    try:
+        conn.execute("INSERT INTO orders (number,counterparty_id,created_by,created_at,status,order_type) VALUES (?,?,?,?,'new','production')",
+                     (number,d.get("cp_id"),user["id"],now))
+        oid=conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        for sh in shortages:
+            conn.execute("INSERT INTO order_items (order_id,nomenclature_id,quantity) VALUES (?,?,?)", (oid,sh["nom_id"],sh["short"]))
+        conn.commit()
+        bot.send_message(tid,f"✅ Отгрузка создана.\n➕ Автозаказ *{number}* на недостающее количество.", parse_mode="Markdown")
+        lines=[f"➕ *Автозаказ {number}* (нехватка при отгрузке)\n"]
+        for sh in shortages: lines.append(f"• {sh['code']} {sh['name']}: {sh['short']:,.1f} {sh['unit']}")
+        notify_roles(("manager","admin","superadmin"),"\n".join(lines))
+    finally:
+        conn.close()
     cancel_state(tid)
 
 def _create_direct_shipment(tid, d, user, partial=False):
     now=datetime.now(); number=next_shipment_number()
     conn=get_db()
-    conn.execute("INSERT INTO shipments (number,created_by,created_at,ship_date,status,shipment_type,notes,counterparty_id) VALUES (?,?,?,?,'pending','direct',?,?)",
-                 (number,user["id"],now,d.get("ship_date"),d.get("notes"),d.get("cp_id")))
-    sid=conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-    for it in d["items"]:
-        qty=min(it["qty"],get_stock(it["nom_id"])) if partial else it["qty"]
-        if qty>0:
-            conn.execute("INSERT INTO shipment_items (shipment_id,nomenclature_id,quantity,sale_price) VALUES (?,?,?,?)",
-                         (sid,it["nom_id"],qty,it.get("price",0)))
-    conn.commit(); conn.close()
-    cancel_state(tid)
-    bot.send_message(tid,f"✅ Отгрузка *{number}* создана!\n⏳ Ожидает подтверждения.", parse_mode="Markdown", reply_markup=ik([("💼 Продажи","mn:sales"),("🏠 Главное меню","mn:back")]))
-    notify_roles(("manager",),f"📤 *Прямая отгрузка {number}*\n👥 {d.get('cp_name','—')}\nПодтвердите в разделе Производство")
+    try:
+        conn.execute("INSERT INTO shipments (number,created_by,created_at,ship_date,status,shipment_type,notes,counterparty_id) VALUES (?,?,?,?,'pending','direct',?,?)",
+                     (number,user["id"],now,d.get("ship_date"),d.get("notes"),d.get("cp_id")))
+        sid=conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        for it in d["items"]:
+            qty=min(it["qty"],get_stock(it["nom_id"])) if partial else it["qty"]
+            if qty>0:
+                conn.execute("INSERT INTO shipment_items (shipment_id,nomenclature_id,quantity,sale_price) VALUES (?,?,?,?)",
+                             (sid,it["nom_id"],qty,it.get("price",0)))
+        conn.commit()
+        cancel_state(tid)
+        bot.send_message(tid,f"✅ Отгрузка *{number}* создана!\n⏳ Ожидает подтверждения.", parse_mode="Markdown", reply_markup=ik([("💼 Продажи","mn:sales"),("🏠 Главное меню","mn:back")]))
+        notify_roles(("manager",),f"📤 *Прямая отгрузка {number}*\n👥 {d.get('cp_name','—')}\nПодтвердите в разделе Производство")
+    finally:
+        conn.close()
 
 # ─── Отгрузка по заказу ───────────────────────────────────────────────────────
 
@@ -1686,25 +1749,28 @@ def _shipment_detail_view(sid):
 
 def _confirm_shipment(tid, sid, user):
     now=datetime.now(); conn=get_db()
-    ship=conn.execute("SELECT * FROM shipments WHERE id=?", (sid,)).fetchone()
-    sitems=conn.execute("SELECT si.*,oi.nomenclature_id,oi.order_id FROM shipment_items si LEFT JOIN order_items oi ON oi.id=si.order_item_id WHERE si.shipment_id=?", (sid,)).fetchall()
-    for si in sitems:
-        if si["order_item_id"]:
-            conn.execute("UPDATE order_items SET shipped_qty=shipped_qty+? WHERE id=?", (si["quantity"],si["order_item_id"]))
-    conn.execute("UPDATE shipments SET status='confirmed',confirmed_by=?,confirmed_at=? WHERE id=?", (user["id"],now,sid))
-    if ship["order_id"]:
-        rem=conn.execute("SELECT SUM(quantity-shipped_qty) FROM order_items WHERE order_id=?", (ship["order_id"],)).fetchone()[0] or 0
-        new_status="shipped" if rem<=0 else "ready"
-        conn.execute("UPDATE orders SET status=? WHERE id=?", (new_status,ship["order_id"]))
-        order=conn.execute("SELECT * FROM orders WHERE id=?", (ship["order_id"],)).fetchone()
-        creator=conn.execute("SELECT * FROM users WHERE id=?", (order["created_by"],)).fetchone()
-        conn.commit(); conn.close()
-        if creator:
-            try: bot.send_message(creator["telegram_id"],
-                f"📦 Отгрузка *{ship['number']}* подтверждена!\nЗаказ {order['number']} {'✅ Отгружен' if new_status=='shipped' else '⚠️ Частично'}", parse_mode="Markdown")
-            except: pass
-    else:
-        conn.commit(); conn.close()
+    try:
+        ship=conn.execute("SELECT * FROM shipments WHERE id=?", (sid,)).fetchone()
+        sitems=conn.execute("SELECT si.*,oi.nomenclature_id,oi.order_id FROM shipment_items si LEFT JOIN order_items oi ON oi.id=si.order_item_id WHERE si.shipment_id=?", (sid,)).fetchall()
+        for si in sitems:
+            if si["order_item_id"]:
+                conn.execute("UPDATE order_items SET shipped_qty=shipped_qty+? WHERE id=?", (si["quantity"],si["order_item_id"]))
+        conn.execute("UPDATE shipments SET status='confirmed',confirmed_by=?,confirmed_at=? WHERE id=?", (user["id"],now,sid))
+        if ship["order_id"]:
+            rem=conn.execute("SELECT SUM(quantity-shipped_qty) FROM order_items WHERE order_id=?", (ship["order_id"],)).fetchone()[0] or 0
+            new_status="shipped" if rem<=0 else "ready"
+            conn.execute("UPDATE orders SET status=? WHERE id=?", (new_status,ship["order_id"]))
+            order=conn.execute("SELECT * FROM orders WHERE id=?", (ship["order_id"],)).fetchone()
+            creator=conn.execute("SELECT * FROM users WHERE id=?", (order["created_by"],)).fetchone()
+            conn.commit()
+            if creator:
+                try: bot.send_message(creator["telegram_id"],
+                    f"📦 Отгрузка *{ship['number']}* подтверждена!\nЗаказ {order['number']} {'✅ Отгружен' if new_status=='shipped' else '⚠️ Частично'}", parse_mode="Markdown")
+                except: pass
+        else:
+            conn.commit()
+    finally:
+        conn.close()
 
 # ─── Производство за день ─────────────────────────────────────────────────────
 
@@ -1806,17 +1872,6 @@ def _start_request(tid, rtype):
     user_states[tid]=f"rq:{rtype}"
     bot.send_message(tid,prompts[rtype]+"\n\n_/cancel для отмены_", parse_mode="Markdown")
 
-def _start_sale_price_input(tid, nom_id):
-    conn=get_db(); nom=conn.execute("SELECT * FROM nomenclature WHERE id=?", (nom_id,)).fetchone(); conn.close()
-    if not nom: return
-    current_price = nom["sale_price"] or 0
-    user_data[tid]["current_price_nom_id"]=nom_id
-    user_data[tid]["current_price_name"]=nom["name"]
-    user_states[tid]="ds:price"
-    bot.send_message(tid,
-        f"💵 *{nom['name']}*\nПрайс: {current_price:,.2f} ₽\n\nВведите цену продажи (или *—* оставить прайс):",
-        parse_mode="Markdown")
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # УНИВЕРСАЛЬНЫЙ ОБРАБОТЧИК ТЕКСТА
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1831,9 +1886,24 @@ def universal_text(message):
         rtype=state.replace("rq:","")
         labels={"absence":"📅 Не выйдет","breakdown":"🔧 Неисправность","mts":"📦 МТС"}
         now=datetime.now(); cancel_state(tid)
-        conn=get_db(); conn.execute("INSERT INTO requests (user_id,type,text,created_at) VALUES (?,?,?,?)",(user["id"],rtype,text,now)); conn.commit(); conn.close()
+        conn=get_db()
+        conn.execute("INSERT INTO requests (user_id,type,text,created_at) VALUES (?,?,?,?)",(user["id"],rtype,text,now))
+        conn.commit(); conn.close()
         bot.send_message(tid,"✅ Заявка отправлена!")
         notify_supervisors(f"📋 *{labels.get(rtype,rtype)}*\n👤 *{user['name']}*\n🕐 {now.strftime('%d.%m.%Y %H:%M')}\n\n📝 {text}"); return
+
+    # Комментарий к заказу
+    if state.startswith("ord:addcomment:"):
+        oid = int(state.split(":")[2])
+        conn = get_db()
+        conn.execute("INSERT INTO order_comments (order_id, user_id, text) VALUES (?, ?, ?)", 
+                    (oid, user["id"], text))
+        conn.commit(); conn.close()
+        cancel_state(tid)
+        bot.send_message(tid, "✅ Комментарий добавлен!")
+        t, k = _order_detail_view(oid, user["role"])
+        bot.send_message(tid, t, reply_markup=k, parse_mode="Markdown")
+        return
 
     # Добавление сотрудника
     if state=="usr:add:id":
@@ -1879,7 +1949,6 @@ def universal_text(message):
         try: qty=float(text.replace(",",".")); assert qty>0
         except: bot.send_message(tid,"Введите число больше нуля."); return
         d=user_data[tid]; nom=d.pop("current_nom")
-        # Сначала спрашиваем цену
         default_price = nom.get("sale_price",0)
         user_data[tid]["pending_item"]={"nom_id":nom["id"],"name":nom["name"],"unit":nom["unit"],"code":nom["code"],"qty":qty,"price":default_price}
         user_states[tid]="ds:item_price"
@@ -1924,7 +1993,6 @@ def universal_text(message):
             nit=items[next_idx]; nr=nit["quantity"]-nit["shipped_qty"]
             bot.send_message(tid,f"Позиция {next_idx+1}/{len(items)}: *{c(nit['code'])} {nit['name']}*\nОстаток: {nr:,.1f} {nit['unit']}\n\nВведите количество:", parse_mode="Markdown")
         else:
-            # Спрашиваем цену для первой позиции
             user_data[tid]["ship_price_idx"]=0; user_states[tid]=f"ship_price:{oid}"
             sq=d["ship_qtys"][0]
             bot.send_message(tid,
@@ -1945,23 +2013,28 @@ def universal_text(message):
             nsq=d["ship_qtys"][next_p]
             bot.send_message(tid,f"💵 Цена для *{nsq['name']}* (прайс: {nsq['sale_price']:,.2f} ₽)\nВведите или *—*:", parse_mode="Markdown")
         else:
-            # Сохраняем отгрузку
             now=datetime.now(); number=next_shipment_number()
             conn=get_db()
-            conn.execute("INSERT INTO shipments (number,order_id,created_by,created_at,ship_date,status,shipment_type) VALUES (?,?,?,?,?,'pending','order')",
-                         (number,oid,user["id"],now,d.get("ship_date")))
-            sid=conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-            for sq2 in d["ship_qtys"]:
-                if sq2["qty"]>0:
-                    conn.execute("INSERT INTO shipment_items (shipment_id,order_item_id,quantity,sale_price) VALUES (?,?,?,?)",
-                                 (sid,sq2["order_item_id"],sq2["qty"],sq2.get("sale_price",0)))
-            conn.execute("UPDATE orders SET status='shipping' WHERE id=?", (oid,)); conn.commit(); conn.close()
-            cancel_state(tid)
-            lines=[f"✅ *{number}* создана!\n\n*Позиции:*"]
-            for sq2 in d["ship_qtys"]:
-                if sq2["qty"]>0: lines.append(f"• {sq2['code']} {sq2['name']}: {sq2['qty']:,.1f} × {sq2['sale_price']:,.2f} ₽")
-            bot.send_message(tid,"\n".join(lines),parse_mode="Markdown", reply_markup=ik([("💼 Продажи","mn:sales"),("🏠 Главное меню","mn:back")]))
-            notify_roles(("manager",),"\n".join(lines)+"\n\nПодтвердите в разделе Производство")
+            try:
+                conn.execute("INSERT INTO shipments (number,order_id,created_by,created_at,ship_date,status,shipment_type) VALUES (?,?,?,?,?,'pending','order')",
+                             (number,oid,user["id"],now,d.get("ship_date")))
+                sid=conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                for sq2 in d["ship_qtys"]:
+                    if sq2["qty"]>0:
+                        conn.execute("INSERT INTO shipment_items (shipment_id,order_item_id,quantity,sale_price) VALUES (?,?,?,?)",
+                                     (sid,sq2["order_item_id"],sq2["qty"],sq2.get("sale_price",0)))
+                conn.execute("UPDATE orders SET status='shipping' WHERE id=?", (oid,))
+                conn.commit()
+                cancel_state(tid)
+                lines=[f"✅ *{number}* создана!\n\n*Позиции:*"]
+                for sq2 in d["ship_qtys"]:
+                    if sq2["qty"]>0: 
+                        lines.append(f"• {sq2['code']} {sq2['name']}: {sq2['qty']:,.1f} × {sq2['sale_price']:,.2f} ₽")
+                bot.send_message(tid,"\n".join(lines),parse_mode="Markdown", 
+                               reply_markup=ik([("💼 Продажи","mn:sales"),("🏠 Главное меню","mn:back")]))
+                notify_roles(("manager",),"\n".join(lines)+"\n\nПодтвердите в разделе Производство")
+            finally:
+                conn.close()
         return
 
     # Производство — количество
@@ -1970,14 +2043,23 @@ def universal_text(message):
         except: bot.send_message(tid,"Введите число."); return
         d=user_data[tid]; nom=d.pop("current_nom"); today=d["date"]; now=datetime.now()
         conn=get_db()
-        ex=conn.execute("SELECT * FROM daily_production WHERE date=? AND nomenclature_id=? AND recorded_by=?", (today,nom["id"],user["id"])).fetchone()
-        if ex: conn.execute("UPDATE daily_production SET quantity=quantity+?,recorded_at=? WHERE id=?", (qty,now,ex["id"]))
-        else:  conn.execute("INSERT INTO daily_production (date,nomenclature_id,quantity,recorded_by,recorded_at) VALUES (?,?,?,?,?)", (today,nom["id"],qty,user["id"],now))
-        updated=conn.execute("SELECT dp.*,n.name,n.unit FROM daily_production dp JOIN nomenclature n ON n.id=dp.nomenclature_id WHERE dp.date=? AND dp.recorded_by=?", (today,user["id"])).fetchall()
-        conn.commit(); conn.close()
-        d["items"]=[{"name":e["name"],"unit":e["unit"],"qty":e["quantity"]} for e in updated]
-        user_states[tid]="prod"; bot.send_message(tid,f"✅ {nom['name']}: {qty:,.1f} {nom['unit']}")
-        _show_prod_picker(tid); return
+        try:
+            ex=conn.execute("SELECT * FROM daily_production WHERE date=? AND nomenclature_id=? AND recorded_by=?", 
+                          (today,nom["id"],user["id"])).fetchone()
+            if ex: conn.execute("UPDATE daily_production SET quantity=quantity+?,recorded_at=? WHERE id=?", 
+                              (qty,now,ex["id"]))
+            else:  conn.execute("INSERT INTO daily_production (date,nomenclature_id,quantity,recorded_by,recorded_at) VALUES (?,?,?,?,?)", 
+                              (today,nom["id"],qty,user["id"],now))
+            updated=conn.execute("SELECT dp.*,n.name,n.unit FROM daily_production dp JOIN nomenclature n ON n.id=dp.nomenclature_id WHERE dp.date=? AND dp.recorded_by=?", 
+                               (today,user["id"])).fetchall()
+            conn.commit()
+            d["items"]=[{"name":e["name"],"unit":e["unit"],"qty":e["quantity"]} for e in updated]
+            user_states[tid]="prod"
+            bot.send_message(tid,f"✅ {nom['name']}: {qty:,.1f} {nom['unit']}")
+            _show_prod_picker(tid)
+        finally:
+            conn.close()
+        return
 
     # Инвентаризация — начальный остаток
     if state=="inv:init:qty":
@@ -1993,14 +2075,22 @@ def universal_text(message):
         try: qty=float(text.replace(",",".")); assert qty>=0
         except: bot.send_message(tid,"Введите число."); return
         d=user_data[tid]; adj_type=d["adj_type"]; nom_id=d["nom_id"]
-        conn=get_db(); nom=conn.execute("SELECT * FROM nomenclature WHERE id=?", (nom_id,)).fetchone(); cur=get_stock(nom_id)
-        if adj_type=="set": diff=qty-cur; atype="add" if diff>=0 else "sub"; aval=abs(diff)
-        elif adj_type=="add": atype="add"; aval=qty
-        else: atype="sub"; aval=qty
-        conn.execute("INSERT INTO stock_adjustments (nomenclature_id,quantity,type,comment,created_by) VALUES (?,?,?,?,?)",
-                     (nom_id,aval,atype,"Инвентаризация",user["id"])); conn.commit(); conn.close()
-        new_stock=get_stock(nom_id); cancel_state(tid)
-        bot.send_message(tid,f"✅ *{nom['name']}*\nБыло: {cur:,.1f} → Стало: *{new_stock:,.1f} {nom['unit']}*", parse_mode="Markdown", reply_markup=ik([("⚙️ Инвентаризация","inv:menu"),("🏠 Главное меню","mn:back")])); return
+        conn=get_db()
+        try:
+            nom=conn.execute("SELECT * FROM nomenclature WHERE id=?", (nom_id,)).fetchone()
+            cur=get_stock(nom_id)
+            if adj_type=="set": diff=qty-cur; atype="add" if diff>=0 else "sub"; aval=abs(diff)
+            elif adj_type=="add": atype="add"; aval=qty
+            else: atype="sub"; aval=qty
+            conn.execute("INSERT INTO stock_adjustments (nomenclature_id,quantity,type,comment,created_by) VALUES (?,?,?,?,?)",
+                         (nom_id,aval,atype,"Инвентаризация",user["id"]))
+            conn.commit()
+            new_stock=get_stock(nom_id)
+            cancel_state(tid)
+            bot.send_message(tid,f"✅ *{nom['name']}*\nБыло: {cur:,.1f} → Стало: *{new_stock:,.1f} {nom['unit']}*", parse_mode="Markdown", reply_markup=ik([("⚙️ Инвентаризация","inv:menu"),("🏠 Главное меню","mn:back")]))
+        finally:
+            conn.close()
+        return
 
     # Изменение цены номенклатуры
     if state.startswith("nm:price:"):
@@ -2009,13 +2099,17 @@ def universal_text(message):
         except: bot.send_message(tid,"Введите число."); return
         field="cost_price" if ptype=="cost" else "sale_price"
         conn=get_db()
-        conn.execute(f"UPDATE nomenclature SET {field}=? WHERE id=?", (price,nom_id))
-        conn.execute("INSERT INTO price_history (nomenclature_id,price_type,price,changed_by) VALUES (?,?,?,?)",
-                     (nom_id,ptype,price,user["id"]))
-        conn.commit(); conn.close()
-        cancel_state(tid)
-        label="Себестоимость" if ptype=="cost" else "Прайс"
-        bot.send_message(tid,f"✅ {label} обновлена: *{price:,.2f} ₽*", parse_mode="Markdown", reply_markup=ik([("📋 Номенклатура","nm:list"),("🏠 Главное меню","mn:back")])); return
+        try:
+            conn.execute(f"UPDATE nomenclature SET {field}=? WHERE id=?", (price,nom_id))
+            conn.execute("INSERT INTO price_history (nomenclature_id,price_type,price,changed_by) VALUES (?,?,?,?)",
+                         (nom_id,ptype,price,user["id"]))
+            conn.commit()
+            cancel_state(tid)
+            label="Себестоимость" if ptype=="cost" else "Прайс"
+            bot.send_message(tid,f"✅ {label} обновлена: *{price:,.2f} ₽*", parse_mode="Markdown", reply_markup=ik([("📋 Номенклатура","nm:list"),("🏠 Главное меню","mn:back")]))
+        finally:
+            conn.close()
+        return
 
     # Номенклатура — добавление
     if state=="nm:add:name":
@@ -2041,7 +2135,8 @@ def universal_text(message):
     # Номенклатура — редактирование
     if state.startswith("nm:edit:"):
         parts=state.split(":"); nom_id=int(parts[2]); field=parts[3]
-        conn=get_db(); conn.execute(f"UPDATE nomenclature SET {field}=? WHERE id=?", (text,nom_id)); conn.commit(); conn.close()
+        conn=get_db()
+        conn.execute(f"UPDATE nomenclature SET {field}=? WHERE id=?", (text,nom_id)); conn.commit(); conn.close()
         cancel_state(tid); bot.send_message(tid,"✅ Обновлено!", reply_markup=ik([("📋 Номенклатура","nm:list"),("🏠 Главное меню","mn:back")])); return
 
     # Контрагент — добавление (автокод)
@@ -2074,19 +2169,22 @@ def universal_text(message):
     # Заказ — редактирование полей
     if state.startswith("ord:edit:"):
         parts=state.split(":"); oid=int(parts[2]); field=parts[3]
-        conn=get_db(); conn.execute(f"UPDATE orders SET {field}=? WHERE id=?", (text,oid)); conn.commit(); conn.close()
+        conn=get_db()
+        conn.execute(f"UPDATE orders SET {field}=? WHERE id=?", (text,oid)); conn.commit(); conn.close()
         cancel_state(tid); bot.send_message(tid,"✅ Обновлено!",reply_markup=ik([(f"📦 К заказу",f"ord:v:{oid}"),(f"🏠 Главное меню","mn:back")])); return
 
     # Отгрузка — редактирование полей
     if state.startswith("ship:edit:"):
         parts=state.split(":"); sid=int(parts[2]); field=parts[3]
-        conn=get_db(); conn.execute(f"UPDATE shipments SET {field}=? WHERE id=?", (text,sid)); conn.commit(); conn.close()
+        conn=get_db()
+        conn.execute(f"UPDATE shipments SET {field}=? WHERE id=?", (text,sid)); conn.commit(); conn.close()
         cancel_state(tid); bot.send_message(tid,"✅ Обновлено!",reply_markup=ik([(f"🚚 К отгрузке",f"ship:v:{sid}"),(f"🏠 Главное меню","mn:back")])); return
 
     # Контрагент — редактирование
     if state.startswith("cp:edit:"):
         parts=state.split(":"); cp_id=int(parts[2]); field=parts[3]
-        conn=get_db(); conn.execute(f"UPDATE counterparties SET {field}=? WHERE id=?", (text,cp_id)); conn.commit(); conn.close()
+        conn=get_db()
+        conn.execute(f"UPDATE counterparties SET {field}=? WHERE id=?", (text,cp_id)); conn.commit(); conn.close()
         cancel_state(tid); bot.send_message(tid,"✅ Обновлено!", reply_markup=ik([("👥 Контрагенты","cp:list"),("🏠 Главное меню","mn:back")])); return
 
     # Постоянные расходы — сумма
@@ -2102,12 +2200,16 @@ def universal_text(message):
         eff_from=datetime.now().strftime("%d.%m.%Y") if text=="-" else text
         d=user_data[tid]; amount=d["amount"]
         conn=get_db()
-        conn.execute("INSERT INTO fixed_expenses (type,amount,description,changed_by,effective_from) VALUES (?,?,?,?,?)",
-                     (etype,amount,d.get("description",""),user["id"],eff_from))
-        conn.commit(); conn.close()
-        cancel_state(tid)
-        label=dict(FIXED_EXPENSE_TYPES).get(etype,etype)
-        bot.send_message(tid,f"✅ *{label}*: {amount:,.2f} ₽ с {eff_from}", parse_mode="Markdown", reply_markup=ik([("💸 Постоянные расходы","exp:fixed:list"),("🏠 Главное меню","mn:back")])); return
+        try:
+            conn.execute("INSERT INTO fixed_expenses (type,amount,description,changed_by,effective_from) VALUES (?,?,?,?,?)",
+                         (etype,amount,d.get("description",""),user["id"],eff_from))
+            conn.commit()
+            cancel_state(tid)
+            label=dict(FIXED_EXPENSE_TYPES).get(etype,etype)
+            bot.send_message(tid,f"✅ *{label}*: {amount:,.2f} ₽ с {eff_from}", parse_mode="Markdown", reply_markup=ik([("💸 Постоянные расходы","exp:fixed:list"),("🏠 Главное меню","mn:back")]))
+        finally:
+            conn.close()
+        return
 
     # Переменные расходы — сумма
     if state=="exp:var:amount":
@@ -2120,11 +2222,40 @@ def universal_text(message):
         d=user_data[tid]; desc=None if text=="-" else text
         today=datetime.now().strftime("%d.%m.%Y")
         conn=get_db()
-        conn.execute("INSERT INTO variable_expenses (category,amount,description,expense_date,created_by) VALUES (?,?,?,?,?)",
-                     (d["category"],d["amount"],desc,today,user["id"]))
-        conn.commit(); conn.close()
-        cancel_state(tid)
-        bot.send_message(tid,f"✅ Расход добавлен!\n{d['category']}: *{d['amount']:,.2f} ₽*", parse_mode="Markdown", reply_markup=ik([("💰 Финансы","mn:finance"),("🏠 Главное меню","mn:back")])); return
+        try:
+            conn.execute("INSERT INTO variable_expenses (category,amount,description,expense_date,created_by) VALUES (?,?,?,?,?)",
+                         (d["category"],d["amount"],desc,today,user["id"]))
+            conn.commit()
+            cancel_state(tid)
+            bot.send_message(tid,f"✅ Расход добавлен!\n{d['category']}: *{d['amount']:,.2f} ₽*", parse_mode="Markdown", reply_markup=ik([("💰 Финансы","mn:finance"),("🏠 Главное меню","mn:back")]))
+        finally:
+            conn.close()
+        return
+
+    # Доплата сотруднику — сумма
+    if state=="sal:bonus:amount":
+        try: amount=float(text.replace(",",".")); assert amount>=0
+        except: bot.send_message(tid,"Введите сумму."); return
+        user_data[tid]["amount"]=amount; user_states[tid]="sal:bonus:desc"
+        bot.send_message(tid,
+            f"👷 *{user_data[tid]['uname']}*\nСумма: {amount:,.2f} ₽\n\nВведите описание доплаты (или *—*):",
+            parse_mode="Markdown"); return
+
+    if state=="sal:bonus:desc":
+        d=user_data[tid]; desc=None if text=="-" else text
+        now=datetime.now(); month_str=now.strftime("%Y-%m")
+        conn=get_db()
+        try:
+            conn.execute("INSERT INTO salary_bonuses (user_id,amount,description,month,created_by) VALUES (?,?,?,?,?)",
+                         (d["uid"],d["amount"],desc,month_str,user["id"]))
+            conn.commit()
+            cancel_state(tid)
+            bot.send_message(tid,
+                f"✅ Доплата для *{d['uname']}*: {d['amount']:,.2f} ₽",
+                parse_mode="Markdown", reply_markup=ik([("💰 Финансы","mn:finance"),("🏠 Главное меню","mn:back")]))
+        finally:
+            conn.close()
+        return
 
 def _save_new_nom(tid, user):
     d=user_data.get(tid,{}); code=next_nom_code()
@@ -2132,7 +2263,6 @@ def _save_new_nom(tid, user):
     try:
         conn.execute("INSERT INTO nomenclature (code,name,unit,notes,cost_price,sale_price) VALUES (?,?,?,?,?,?)",
                      (code,d["name"],d["unit"],d.get("notes"),d.get("cost_price",0),d.get("sale_price",0)))
-        conn.commit()
         if d.get("cost_price",0)>0:
             nom_id=conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             conn.execute("INSERT INTO price_history (nomenclature_id,price_type,price,changed_by) VALUES (?,?,?,?)",
@@ -2147,25 +2277,6 @@ def _save_new_nom(tid, user):
         bot.send_message(tid,f"❌ Ошибка: {e}")
     finally: conn.close()
     cancel_state(tid)
-
-# Выбор роли при добавлении сотрудника
-@bot.callback_query_handler(func=lambda c: c.data.startswith("usr:role:"))
-def usr_role_select(call):
-    user=get_user(call.from_user.id); role=call.data.split(":")[2]
-    d=user_data.get(call.from_user.id,{})
-    new_tid=d.get("new_tid"); name=d.get("name",""); ans(call)
-    if not new_tid or not name: cancel_state(call.from_user.id); return
-    conn=get_db()
-    try:
-        conn.execute("INSERT INTO users (telegram_id,name,role) VALUES (?,?,?)", (new_tid,name,role))
-        conn.commit()
-        bot.send_message(call.from_user.id,f"✅ *{name}* — {ROLE_LABELS[role]}", parse_mode="Markdown")
-        try: bot.send_message(new_tid,f"✅ Вы зарегистрированы как *{name}*.\nНажмите /start", parse_mode="Markdown")
-        except: pass
-    except sqlite3.IntegrityError:
-        bot.send_message(call.from_user.id,"⚠️ Пользователь уже есть.")
-    finally: conn.close()
-    cancel_state(call.from_user.id)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ФОНОВЫЕ ЗАДАЧИ
@@ -2193,20 +2304,6 @@ def reminder_loop():
                     conn.execute("UPDATE time_records SET status='no_checkout',check_out=? WHERE id=?", (now,rec["id"])); conn.commit()
                     bot.send_message(rec["telegram_id"],"⚠️ Смена закрыта автоматически.")
                     notify_supervisors(f"⚠️ *{rec['name']}* не отметил уход. Смена с {dt.strftime('%H:%M %d.%m')}.")
-
-            # Напоминания о новых заказах начальнику цеха (каждые 2 часа)
-            new_orders=conn.execute(
-                "SELECT o.*,c.name as cp_name FROM orders o LEFT JOIN counterparties c ON c.id=o.counterparty_id "
-                "WHERE o.status='new' AND o.created_at <= ?",
-                (now - timedelta(hours=2),)
-            ).fetchall()
-            if new_orders:
-                managers=conn.execute("SELECT telegram_id FROM users WHERE role='manager'").fetchall()
-                for o in new_orders:
-                    msg=f"⏰ *Напоминание о новом заказе!*\n\n📦 *{o['number']}*\n👥 {o['cp_name'] or '—'}\n📅 {fmt_dt(o['created_at'])}\n\nЗаказ ожидает принятия!"
-                    for m in managers:
-                        try: bot.send_message(m["telegram_id"],msg,parse_mode="Markdown")
-                        except: pass
 
             conn.close()
         except Exception as e: print(f"[reminder] {e}")
